@@ -76,6 +76,7 @@ pub struct SessionRow {
     pub harness_label: Option<String>,
     pub model: Option<String>,
     pub model_label: Option<String>,
+    pub agent: Option<String>,
     pub reasoning: Option<String>,
     pub branch: Option<String>,
     pub cwd: Option<String>,
@@ -385,6 +386,7 @@ fn hash_row(row: &SessionRow) -> u64 {
     row.device_online.hash(&mut h);
     row.harness.hash(&mut h);
     row.model.hash(&mut h);
+    row.agent.hash(&mut h);
     row.reasoning.hash(&mut h);
     row.branch.hash(&mut h);
     row.cwd.hash(&mut h);
@@ -486,6 +488,10 @@ fn build_row(chat: &Chat, rc: &RowContext<'_>, cx: &DeriveContext<'_>) -> Arc<Se
         },
         harness,
         model,
+        agent: config
+            .and_then(|c| c.model_options.get("agent"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
         reasoning,
         branch: chat
             .source_context

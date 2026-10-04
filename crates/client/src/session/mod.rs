@@ -1109,6 +1109,20 @@ impl SessionHandle {
         hold_for_turn_end: bool,
     ) -> Result<String> {
         let mut item = QueuedMessage::new(crate::new_id(), text, device_id);
+        let client = self.core.client()?;
+        if let Some(config) = client
+            .workspace
+            .chat(&self.core.chat_id)
+            .and_then(|c| c.config)
+            && config.harness == zeron_proto::HarnessId::Opencode
+        {
+            item.agent = config
+                .model_options
+                .get("agent")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            item.agent_snapshot = true;
+        }
         item.attachments = attachments;
         item.hold_for_turn_end = hold_for_turn_end;
         item.issued_at = now_ms();
@@ -1445,5 +1459,53 @@ impl SessionHandle {
         client.after_command(&self.core, true);
         client.kick_room(&self.core.chat_id);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod opencode_tests {
+    use super::*;
+
+    #[test]
+    fn queued_agents_survive_later_config_changes_including_server_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = crate::Client::new(
+            crate::ClientConfig::new("https://edge.invalid", dir.path()),
+            crate::Credentials::Demo(Default::default()),
+            Arc::new(crate::events::NullListener),
+        )
+        .unwrap();
+        let chat = "chat-picker";
+        let session = client.open_session(chat).unwrap();
+        let mut config = client.session_config(chat).unwrap();
+        config.harness = zeron_proto::HarnessId::Opencode;
+        config
+            .model_options
+            .insert("agent".into(), serde_json::json!("custom/plan"));
+        client.set_session_config(chat, &config).unwrap();
+        session
+            .enqueue_inner(client.device_id(), "plan", vec![], true)
+            .unwrap();
+        let selected = client.workspace().session(chat).unwrap().clone();
+        assert_eq!(selected.agent.as_deref(), Some("custom/plan"));
+        config.model_options.remove("agent");
+        client.set_session_config(chat, &config).unwrap();
+        let cleared = client.workspace().session(chat).unwrap().clone();
+        assert_eq!(cleared.agent, None);
+        assert_ne!(selected.revision, cleared.revision);
+        session
+            .enqueue_inner(client.device_id(), "default", vec![], true)
+            .unwrap();
+        config
+            .model_options
+            .insert("agent".into(), serde_json::json!("build"));
+        client.set_session_config(chat, &config).unwrap();
+        let queue = session.core.doc().read_queue().unwrap();
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].agent.as_deref(), Some("custom/plan"));
+        assert!(queue[0].agent_snapshot);
+        assert_eq!(queue[1].agent, None);
+        assert!(queue[1].agent_snapshot);
+        client.shutdown();
     }
 }

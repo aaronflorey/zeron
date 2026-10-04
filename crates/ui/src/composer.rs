@@ -8629,6 +8629,7 @@ impl Composer {
                         "text": queue_text,
                         "attachments": attachment_paths,
                         "holdForTurnEnd": true,
+                        "agent": resolved.model_options.get("agent"),
                     });
                     let reply = engine
                         .client()

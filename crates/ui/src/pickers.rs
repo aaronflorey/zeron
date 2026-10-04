@@ -143,6 +143,18 @@ pub struct ResolvedRunConfig {
     pub model_options: serde_json::Map<String, serde_json::Value>,
 }
 
+fn catalog_reply_is_current(current: (u64, u64, u64), requested: (u64, u64, u64)) -> bool {
+    current == requested
+}
+
+fn model_reply_directory_matches(
+    harness: HarnessId,
+    current: Option<&str>,
+    requested: Option<&str>,
+) -> bool {
+    harness != HarnessId::Opencode || current == requested
+}
+
 impl ResolvedRunConfig {
     /// The `ChatConfig` recorded on `Mutate createChat` (needs a known harness).
     pub fn chat_config(&self) -> Option<ChatConfig> {
@@ -168,9 +180,18 @@ pub fn default_model(models: &[Model]) -> Option<&Model> {
 }
 
 /// An explicit selection never silently becomes a different model after refresh.
-fn selected_catalog_model<'a>(models: &'a [Model], selected: Option<&str>) -> Option<&'a Model> {
-    match selected {
-        Some(id) => models.iter().find(|model| model.id == id),
+fn selected_catalog_model<'a>(
+    harness: HarnessId,
+    models: &'a [Model],
+    selected_id: Option<&str>,
+    explicit: bool,
+) -> Option<&'a Model> {
+    match selected_id {
+        Some(id) => models.iter().find(|model| model.id == id).or_else(|| {
+            (harness == HarnessId::Opencode && !explicit)
+                .then(|| default_model(models))
+                .flatten()
+        }),
         None => default_model(models),
     }
 }
@@ -624,6 +645,10 @@ pub struct Pickers {
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
     model_refresh_errors: HashMap<HarnessId, String>,
+    model_requests: HashMap<HarnessId, u64>,
+    refresh_task: Option<Task<()>>,
+    catalog_cwd: Option<String>,
+    catalog_generation: u64,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
@@ -756,11 +781,16 @@ impl Pickers {
                 this.config.model = None;
                 this.config.reasoning = None;
                 this.switch_error = None;
+                this.invalidate_model_catalogs();
             }
             // A space switch invalidates the branch draft + cache — the folder
             // (and possibly the device) changed under them.
             let space = state.read(cx).selected_space.clone();
-            let device = state.read(cx).effective_device_id();
+            let device = state
+                .read(cx)
+                .selected_chat_row()
+                .map(|c| c.device_id.clone())
+                .or_else(|| state.read(cx).effective_device_id());
             if space != this.space_owner || device != this.device_owner {
                 this.space_owner = space;
                 this.device_owner = device;
@@ -776,17 +806,20 @@ impl Pickers {
                 // Catalogs are per-DEVICE (fetched from the space's host):
                 // a space switch may land on another device, so refetch.
                 this.harnesses = Loadable::Idle;
-                this.models.clear();
-                this.model_refresh_errors.clear();
-                this.catalog_rev += 1;
+                this.invalidate_model_catalogs();
             }
             cx.notify();
         });
-        // A Settings → Providers toggle changed some device's enabled set:
-        // force-refresh the cached catalog so the rail/chips follow without a
-        // restart (stale rows stay visible while the reload runs).
+        // Settings changed the execution device's catalog or connection.
+        // Invalidate outstanding requests before loading from that device.
         let catalog_observe = cx.observe_global::<HarnessCatalogChanged>(|this: &mut Self, cx| {
-            this.ensure_harnesses(true, cx);
+            this.target_generation = this.target_generation.wrapping_add(1);
+            this.load_task = None;
+            this.harnesses = Loadable::Idle;
+            this.invalidate_model_catalogs();
+            this.ensure_harnesses(false, cx);
+            this.prefetch_models(false, cx);
+
             cx.notify();
         });
         // Dev/testing knob: `ZERON_OPEN_PICKER=model|traits|repo|branch` boots
@@ -819,7 +852,11 @@ impl Pickers {
         }
         let draft_owner = state.read(cx).selected_chat.clone();
         let space_owner = state.read(cx).selected_space.clone();
-        let device_owner = state.read(cx).effective_device_id();
+        let device_owner = state
+            .read(cx)
+            .selected_chat_row()
+            .map(|c| c.device_id.clone())
+            .or_else(|| state.read(cx).effective_device_id());
         Self {
             state,
             space_owner,
@@ -858,6 +895,10 @@ impl Pickers {
             harnesses: Loadable::Idle,
             models: HashMap::new(),
             model_refresh_errors: HashMap::new(),
+            model_requests: HashMap::new(),
+            refresh_task: None,
+            catalog_cwd: None,
+            catalog_generation: 0,
             refs: Loadable::Idle,
             refs_space: None,
             active: 0,
@@ -944,7 +985,10 @@ impl Pickers {
             return None;
         }
         let state = self.state.read(cx);
-        let device = state.effective_device_id()?;
+        let device = state
+            .selected_chat_row()
+            .map(|c| c.device_id.clone())
+            .or_else(|| state.effective_device_id())?;
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
     }
 
@@ -1009,10 +1053,56 @@ impl Pickers {
         self.defaults.model_for(harness).map(|m| m.id.as_str())
     }
 
-    /// Effective reasoning — always concrete once the model is known: the
-    /// draft pick / chat config / remembered default, clamped to the selected
-    /// model's ladder, falling back to the model's default level.
+    fn catalog_directory(&self, cx: &App) -> Option<String> {
+        let state = self.state.read(cx);
+        if let Some(chat) = state.selected_chat_row() {
+            return chat
+                .cwd
+                .clone()
+                .or_else(|| state.selected_space_row().map(|s| s.path.clone()));
+        }
+        match self.checkout_plan() {
+            CheckoutPlan::ReuseWorktree { path, .. } => Some(path),
+            _ => state.selected_space_row().map(|s| s.path.clone()),
+        }
+    }
+
+    /// Invalidate project-scoped catalogs and their outstanding replies without
+    /// cancelling the device's harness-list request when only the chat changes.
+    fn invalidate_model_catalogs(&mut self) {
+        self.models.clear();
+        self.model_refresh_errors.clear();
+        self.model_requests.clear();
+        self.catalog_generation = self.catalog_generation.wrapping_add(1);
+        self.refresh_task = None;
+        self.catalog_rev += 1;
+    }
+
+    fn sync_catalog_directory(&mut self, cx: &mut Context<Self>) {
+        let cwd = self.catalog_directory(cx);
+        if cwd != self.catalog_cwd {
+            self.catalog_cwd = cwd;
+            self.invalidate_model_catalogs();
+        }
+    }
+
+    /// Effective reasoning: honor live OpenCode selections; otherwise clamp
+    /// the draft/chat/default pick to the selected model's ladder.
     fn effective_reasoning(&self, cx: &App) -> Option<ReasoningLevel> {
+        // OpenCode commands can select a variant (or the server default) on
+        // the live session. The synced chat config is authoritative, even
+        // while its model catalog is still partial. Do not turn a cleared
+        // variant back into our preferred default on the next send.
+        if self.config.reasoning.is_none()
+            && self.effective_harness(cx) == Some(HarnessId::Opencode)
+            && let Some(config) = self
+                .state
+                .read(cx)
+                .selected_chat_row()
+                .and_then(|chat| chat.config.as_ref())
+        {
+            return config.reasoning;
+        }
         let explicit = self.config.reasoning.or_else(|| {
             match self.state.read(cx).selected_chat_row() {
                 Some(chat) => chat.config.as_ref().and_then(|c| c.reasoning),
@@ -1032,8 +1122,9 @@ impl Pickers {
         clamp_reasoning(explicit, &self.trait_ladder(cx))
     }
 
-    /// Only an implicit selection follows the harness default. An explicit ID
-    /// absent from the live catalog keeps its identity and remembered chip label.
+    /// The selected model — concrete from the moment the list loads: the
+    /// effective id when the list still offers it. OpenCode keeps an explicit
+    /// ID even when a partial catalog omits it.
     fn selected_model<'a>(&'a self, cx: &'a App) -> Option<&'a Model> {
         let harness = self.effective_harness(cx)?;
         let models = self.models.get(&harness)?.ready()?;
@@ -1042,7 +1133,15 @@ impl Pickers {
         if self.title.is_some() && selected.is_none() {
             return None;
         }
-        selected_catalog_model(models, selected)
+        let explicit = self.config.model.is_some()
+            || self
+                .state
+                .read(cx)
+                .selected_chat_row()
+                .and_then(|chat| chat.config.as_ref())
+                .and_then(|config| config.model.as_ref())
+                .is_some();
+        selected_catalog_model(harness, models, selected, explicit)
     }
 
     fn model_name(&self, cx: &App) -> ModelName {
@@ -1066,6 +1165,8 @@ impl Pickers {
         }
     }
 
+    /// Only an implicit selection follows the harness default. An explicit ID
+    /// absent from the live catalog keeps its identity and remembered chip label.
     fn selected_model_label(&self, cx: &App) -> Option<String> {
         self.selected_model(cx)
             .map(|model| model.label.clone())
@@ -1142,7 +1243,7 @@ impl Pickers {
 
     /// The fully-resolved config the composer threads into the Run request and
     /// `Mutate createChat`: concrete model + reasoning whenever the catalog is
-    /// loaded (no "engine picks a default" passthrough).
+    /// loaded, except an OpenCode session using the server's default variant.
     pub fn resolved(&self, cx: &App) -> ResolvedRunConfig {
         ResolvedRunConfig {
             harness: self.effective_harness(cx),
@@ -1192,6 +1293,7 @@ impl Pickers {
         self.setting_bounds = None;
         self.close_config();
         self.menu_bar = popover::MenuScrollbarState::default();
+        self.refresh_task = None;
         if self.open.begin_close() {
             popover::reap_popup(cx, |pickers: &mut Self| &mut pickers.open);
         }
@@ -1358,6 +1460,8 @@ impl Pickers {
                 // cold start. Revalidate on every open instead of pinning a
                 // timeout/fallback result until the application restarts.
                 self.prefetch_models(true, cx);
+
+                self.schedule_opencode_refresh(cx);
             }
             // Projects and devices are already synced state — nothing to load.
             PickerKind::Space | PickerKind::Device => {}
@@ -1421,6 +1525,9 @@ impl Pickers {
                     Err(err) => Loadable::Error(err.to_string()),
                 };
                 pickers.prefetch_models(false, cx);
+                if matches!(pickers.open_kind(), Some(PickerKind::HarnessModel)) {
+                    pickers.schedule_opencode_refresh(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -1433,6 +1540,7 @@ impl Pickers {
     /// "Loading models…" round-trip. Each `ensure_models` call is guarded by
     /// its slot state, so re-running this every catalog load/render is free.
     fn prefetch_models(&mut self, force: bool, cx: &mut Context<Self>) {
+        self.sync_catalog_directory(cx);
         let mut targets: Vec<HarnessId> = match self.harnesses.ready() {
             Some(list) => self.offered(list).iter().map(|d| d.id).collect(),
             None => Vec::new(),
@@ -1450,6 +1558,7 @@ impl Pickers {
     }
 
     fn ensure_models(&mut self, harness: HarnessId, force: bool, cx: &mut Context<Self>) {
+        self.sync_catalog_directory(cx);
         // Normal prefetches load absent/Idle slots once. Picker-open refreshes
         // also retry Ready/Error slots, while an in-flight load is always
         // reused. Ready rows stay visible until the replacement lands.
@@ -1466,22 +1575,28 @@ impl Pickers {
         };
         let target = self.space_target(cx);
         let generation = self.target_generation;
+        let catalog_generation = self.catalog_generation;
+        let cwd = (harness == HarnessId::Opencode)
+            .then(|| self.catalog_cwd.clone())
+            .flatten();
+        let request = self.model_requests.entry(harness).or_default();
+        *request = request.wrapping_add(1);
+        let request = *request;
         if !matches!(self.models.get(&harness), Some(Loadable::Ready(_))) {
             self.models.insert(harness, Loadable::Loading);
             self.catalog_rev += 1;
         }
         cx.spawn(async move |this, cx| {
             let mut params = serde_json::json!({ "harness": harness, "force": force });
+            if let Some(cwd) = &cwd {
+                params["cwd"] = serde_json::Value::String(cwd.clone());
+            }
             if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
                 object.insert(
                     "targetDeviceId".into(),
                     serde_json::Value::String(target.clone()),
                 );
             }
-            // A plugin-heavy OpenCode cold start can fail once while caches,
-            // MCP servers, or plugin runtimes are still warming. Keep this
-            // single Loading slot alive for two retries so recovery requires
-            // no picker close/reopen and cannot launch duplicate probes.
             let mut attempt = 1_u64;
             let result = loop {
                 let result = engine
@@ -1510,7 +1625,22 @@ impl Pickers {
                 cx.background_executor().timer(delay).await;
             }
             this.update(cx, |pickers, cx| {
-                if pickers.target_generation != generation {
+                if !catalog_reply_is_current(
+                    (
+                        pickers.target_generation,
+                        pickers.catalog_generation,
+                        pickers
+                            .model_requests
+                            .get(&harness)
+                            .copied()
+                            .unwrap_or_default(),
+                    ),
+                    (generation, catalog_generation, request),
+                ) || !model_reply_directory_matches(
+                    harness,
+                    pickers.catalog_cwd.as_deref(),
+                    cwd.as_deref(),
+                ) {
                     return;
                 }
                 let loaded = match result {
@@ -1567,6 +1697,37 @@ impl Pickers {
             self.active = self.selected_model_index(cx);
         }
         cx.notify();
+    }
+
+    fn schedule_opencode_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.effective_harness(cx) != Some(HarnessId::Opencode) {
+            return;
+        }
+        let generation = self.catalog_generation;
+        let target_generation = self.target_generation;
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
+            for delay in [2, 3] {
+                cx.background_executor()
+                    .timer(Duration::from_secs(delay))
+                    .await;
+                let still_open = this
+                    .update(cx, |pickers, cx| {
+                        if pickers.catalog_generation != generation
+                            || pickers.target_generation != target_generation
+                            || !matches!(pickers.open_kind(), Some(PickerKind::HarnessModel))
+                        {
+                            return false;
+                        }
+                        pickers.ensure_models(HarnessId::Opencode, true, cx);
+
+                        true
+                    })
+                    .unwrap_or(false);
+                if !still_open {
+                    return;
+                }
+            }
+        }));
     }
 
     /// ListRefs for the selected SPACE's folder — targeted at the space's
@@ -1774,6 +1935,9 @@ impl Pickers {
         }
         self.model_scroll_base().set_offset(gpui::Point::default());
         self.ensure_models(harness, false, cx);
+        if harness == HarnessId::Opencode && self.open_kind() == Some(PickerKind::HarnessModel) {
+            self.schedule_opencode_refresh(cx);
+        }
         // Re-anchor the keyboard highlight onto the new harness's selected row.
         self.active = self.selected_model_index(cx);
         cx.notify();
@@ -3592,9 +3756,7 @@ impl Pickers {
                         PickerKind::Branch | PickerKind::Checkout => this.ensure_refs(true, cx),
                         PickerKind::HarnessModel => {
                             this.harnesses = Loadable::Idle;
-                            this.models.clear();
-                            this.model_refresh_errors.clear();
-                            this.catalog_rev += 1;
+                            this.invalidate_model_catalogs();
                             this.ensure_harnesses(false, cx);
                         }
                         // Projects/devices load nothing; no retry surface exists.
@@ -4050,6 +4212,19 @@ impl Pickers {
                     .min_w_0()
                     .text_size(crate::typography::ui_rems(13.0))
                     .child(self.search.clone()),
+            )
+            .child(
+                div()
+                    .id("model-refresh")
+                    .cursor_pointer()
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.text_muted)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.prefetch_models(true, cx);
+
+                        this.schedule_opencode_refresh(cx);
+                    }))
+                    .child(SharedString::from("Refresh")),
             );
 
         // ── model rows: a VIRTUALIZED uniform list — only the visible slice
@@ -4105,6 +4280,7 @@ impl Pickers {
                         cx,
                     )]
                 }
+                Some(Loadable::Ready(_)) => vec![empty_list_note(&theme, "No models available")],
                 _ => vec![popover::skeleton_menu_rows(
                     "model-skeleton",
                     &theme,
@@ -6111,8 +6287,13 @@ mod tests {
     #[test]
     fn explicit_missing_model_does_not_resolve_to_the_catalog_default() {
         let rows = vec![bare_model("first", "First")];
-        assert_eq!(selected_catalog_model(&rows, None).unwrap().id, "first");
-        assert!(selected_catalog_model(&rows, Some("saved")).is_none());
+        assert_eq!(
+            selected_catalog_model(HarnessId::Opencode, &rows, None, false)
+                .unwrap()
+                .id,
+            "first"
+        );
+        assert!(selected_catalog_model(HarnessId::Opencode, &rows, Some("saved"), true).is_none());
     }
 
     fn side_chat_picker(unsaved: bool, cx: &mut App) -> (Entity<AppState>, Entity<Pickers>) {
@@ -6923,6 +7104,60 @@ mod tests {
             description: None,
             reasoning_levels: Vec::new(),
             options: Vec::new(),
+        }
+    }
+
+    #[gpui::test]
+    fn server_selection_changes_reach_pickers_and_the_next_request(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let mut chat: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
+            "id":"chat", "deviceId":"host", "archived":false,
+            "createdAt":"2026-09-19T00:00:00Z",
+            "config":{"harness":"opencode","modelOptions":{"agent":"build"},"model":"custom/initial",
+                "reasoning":"low","sandbox":"workspace-write"}
+        }))
+        .unwrap();
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.apply_chats(vec![chat.clone()]);
+            state.selected_chat = Some("chat".into());
+            state
+        });
+        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        pickers.update(cx, |pickers, _| {
+            let mut model = bare_model("custom/review", "Review");
+            // A partially loaded catalog must not downgrade the server's
+            // selected XHigh or turn its default variant back into High.
+            model.reasoning_levels = vec![ReasoningLevel::Low, ReasoningLevel::High];
+            pickers
+                .models
+                .insert(HarnessId::Opencode, Loadable::Ready(vec![model]));
+        });
+        for reasoning in [Some(ReasoningLevel::XHigh), Some(ReasoningLevel::Low), None] {
+            let config = chat.config.as_mut().unwrap();
+            config
+                .model_options
+                .insert("agent".into(), serde_json::json!("plan"));
+            config.model = Some("custom/review".into());
+            config.reasoning = reasoning;
+            state.update(cx, |state, cx| {
+                state.apply_chats(vec![chat.clone()]);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            pickers.read_with(cx, |pickers, cx| {
+                assert_eq!(pickers.effective_model_id(cx), Some("custom/review"));
+                assert_eq!(pickers.effective_reasoning(cx), reasoning);
+                let next = pickers.resolved(cx);
+                assert_eq!(
+                    next.model_options
+                        .get("agent")
+                        .and_then(serde_json::Value::as_str),
+                    Some("plan")
+                );
+                assert_eq!(next.model.as_deref(), Some("custom/review"));
+                assert_eq!(next.reasoning, reasoning);
+            });
         }
     }
 
@@ -8879,6 +9114,67 @@ mod tests {
     }
 
     #[test]
+    fn catalog_replies_require_the_same_target_scope_and_request() {
+        let current = (7, 11, 4);
+        assert!(catalog_reply_is_current(current, current));
+        assert!(!catalog_reply_is_current(current, (6, 11, 4))); // device changed
+        assert!(!catalog_reply_is_current(current, (7, 10, 4))); // directory/connection changed
+        assert!(!catalog_reply_is_current(current, (7, 11, 3))); // newer refresh won
+        assert!(model_reply_directory_matches(
+            HarnessId::Codex,
+            Some("/project"),
+            None
+        ));
+        assert!(!model_reply_directory_matches(
+            HarnessId::Opencode,
+            Some("/project"),
+            None
+        ));
+    }
+
+    #[gpui::test]
+    fn switching_chats_preserves_the_pending_harness_catalog(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let chats = ["first", "second"].map(|id| {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "deviceId": "host", "archived": false,
+                "createdAt": "2026-09-19T00:00:00Z",
+                "config": {"harness": "opencode", "sandbox": "workspace-write"}
+            }))
+            .unwrap()
+        });
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.apply_chats(chats.into());
+            state.selected_chat = Some("first".into());
+            state
+        });
+        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        let (target_generation, catalog_generation) = pickers.update(cx, |pickers, _| {
+            pickers.harnesses = Loadable::Loading;
+            pickers
+                .models
+                .insert(HarnessId::Opencode, Loadable::Loading);
+            (pickers.target_generation, pickers.catalog_generation)
+        });
+
+        state.update(cx, |state, cx| {
+            state.selected_chat = Some("second".into());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        pickers.update(cx, |pickers, _| {
+            assert!(matches!(pickers.harnesses, Loadable::Loading));
+            assert_eq!(
+                pickers.target_generation, target_generation,
+                "the pending device catalog must still be allowed to finish"
+            );
+            assert_ne!(pickers.catalog_generation, catalog_generation);
+            assert!(pickers.models.is_empty());
+        });
+    }
+
+    #[test]
     fn default_model_is_first_catalog_row() {
         let models = vec![
             Model {
@@ -8898,6 +9194,26 @@ mod tests {
         ];
         assert_eq!(default_model(&models).map(|m| &*m.id), Some("flagship"));
         assert!(default_model(&[]).is_none());
+    }
+
+    #[test]
+    fn partial_opencode_catalog_keeps_an_explicit_model_choice() {
+        let rows = vec![bare_model("provider/early", "Early")];
+        assert!(
+            selected_catalog_model(
+                HarnessId::Opencode,
+                &rows,
+                Some("custom/model/with/slashes"),
+                true,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            selected_catalog_model(HarnessId::Opencode, &rows, Some("old-default"), false)
+                .map(|model| model.id.as_str()),
+            Some("provider/early")
+        );
+        assert!(selected_catalog_model(HarnessId::Codex, &rows, Some("missing"), true).is_none());
     }
 
     #[test]

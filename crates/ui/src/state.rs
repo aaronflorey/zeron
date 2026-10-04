@@ -4800,6 +4800,8 @@ mod tests {
             duration_ms: None,
         };
         let row = |id: &str| zeron_doc::QueuedMessage {
+            agent: None,
+            agent_snapshot: false,
             id: id.into(),
             text: "held".into(),
             attachments: vec![],

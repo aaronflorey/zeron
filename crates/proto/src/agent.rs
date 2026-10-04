@@ -192,6 +192,44 @@ pub struct Model {
     pub options: Vec<ModelOption>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessAgent {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Public metadata for the execution device's OpenCode connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpencodeConnectionSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    pub username: String,
+    pub has_password: bool,
+}
+
+/// A password is never returned over the read RPC. Omission keeps the saved value.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpencodeConnectionUpdate {
+    #[serde(default)]
+    pub base_url: Option<String>,
+    pub username: String,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub clear_password: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpencodeConnectionTestResult {
+    pub version: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelOption {
@@ -615,6 +653,19 @@ pub enum AgentEvent {
     #[serde(rename_all = "camelCase")]
     AvailableCommands {
         commands: Vec<SlashCommand>,
+    },
+    /// The harness changed the effective agent for this session (for example,
+    /// an OpenCode command or skill selected a different agent). The engine
+    /// mirrors this into the chat config so later turns and the picker stay in
+    /// sync with the server.
+    AgentChanged {
+        agent: String,
+    },
+    /// The session selected a model and its effective thinking level. `None`
+    /// clears the previous level when the model uses its default variant.
+    ModelChanged {
+        model: String,
+        reasoning: Option<ReasoningLevel>,
     },
     Error {
         message: String,

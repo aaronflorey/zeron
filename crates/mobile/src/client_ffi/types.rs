@@ -483,6 +483,7 @@ pub struct SessionRow {
     pub harness_label: Option<String>,
     pub model: Option<String>,
     pub model_label: Option<String>,
+    pub agent: Option<String>,
     /// Wire effort (`xhigh`).
     pub reasoning: Option<String>,
     pub branch: Option<String>,
@@ -529,6 +530,7 @@ impl From<&zc::SessionRow> for SessionRow {
             harness_label: r.harness_label.clone(),
             model: r.model.clone(),
             model_label: r.model_label.clone(),
+            agent: r.agent.clone(),
             reasoning: r.reasoning.clone(),
             branch: r.branch.clone(),
             cwd: r.cwd.clone(),
@@ -761,6 +763,7 @@ pub struct ChatConfig {
     /// `claude-code`, `codex`, …
     pub harness: String,
     pub model: Option<String>,
+    pub agent: Option<String>,
     /// `low` … `ultrathink`.
     pub reasoning: Option<String>,
     /// Model option id → choice id (`contextWindow` → `1m`).
@@ -788,6 +791,11 @@ impl From<&zc::ChatConfig> for ChatConfig {
         Self {
             harness: wire(&c.harness),
             model: c.model.clone(),
+            agent: c
+                .model_options
+                .get("agent")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
             reasoning: c.reasoning.as_ref().map(wire),
             model_options: c
                 .model_options
@@ -818,11 +826,21 @@ impl TryFrom<ChatConfig> for zc::ChatConfig {
                 .as_deref()
                 .map(|r| from_wire(r, "reasoning level"))
                 .transpose()?,
-            model_options: c
-                .model_options
-                .into_iter()
-                .map(|(k, v)| (k, serde_json::Value::String(v)))
-                .collect(),
+            model_options: {
+                let mut options: serde_json::Map<String, serde_json::Value> = c
+                    .model_options
+                    .into_iter()
+                    .map(|(k, v)| (k, serde_json::Value::String(v)))
+                    .collect();
+                if c.harness == "opencode" {
+                    if let Some(agent) = c.agent {
+                        options.insert("agent".into(), serde_json::json!(agent));
+                    } else {
+                        options.remove("agent");
+                    }
+                }
+                options
+            },
             sandbox: match c.sandbox {
                 SandboxLevel::ReadOnly => zeron_proto::SandboxLevel::ReadOnly,
                 SandboxLevel::WorkspaceWrite => zeron_proto::SandboxLevel::WorkspaceWrite,
@@ -1083,4 +1101,86 @@ pub struct PushPrefs {
     pub done: bool,
     pub input: bool,
     pub failed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct HarnessAgent {
+    pub id: String,
+    pub label: String,
+    pub description: Option<String>,
+}
+
+impl From<zeron_proto::HarnessAgent> for HarnessAgent {
+    fn from(a: zeron_proto::HarnessAgent) -> Self {
+        Self {
+            id: a.id,
+            label: a.label,
+            description: a.description,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct OpencodeConnectionSettings {
+    pub base_url: Option<String>,
+    pub username: String,
+    pub has_password: bool,
+}
+
+impl From<zeron_proto::OpencodeConnectionSettings> for OpencodeConnectionSettings {
+    fn from(c: zeron_proto::OpencodeConnectionSettings) -> Self {
+        Self {
+            base_url: c.base_url,
+            username: c.username,
+            has_password: c.has_password,
+        }
+    }
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct OpencodeConnectionUpdate {
+    pub base_url: Option<String>,
+    pub username: String,
+    pub password: Option<String>,
+    pub clear_password: bool,
+}
+
+impl From<OpencodeConnectionUpdate> for zeron_proto::OpencodeConnectionUpdate {
+    fn from(c: OpencodeConnectionUpdate) -> Self {
+        Self {
+            base_url: c.base_url,
+            username: c.username,
+            password: c.password,
+            clear_password: c.clear_password,
+        }
+    }
+}
+
+#[cfg(test)]
+mod opencode_config_tests {
+    use super::*;
+
+    #[test]
+    fn agent_picker_uses_upstream_model_options_and_preserves_other_options() {
+        let mut config = zc::ChatConfig {
+            harness: zeron_proto::HarnessId::Opencode,
+            model: Some("custom/model".into()),
+            reasoning: None,
+            model_options: serde_json::json!({"agent":"plan", "context":"large"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+        };
+        let mut ffi = ChatConfig::from(&config);
+        assert_eq!(ffi.agent.as_deref(), Some("plan"));
+        ffi.agent = Some("review".into());
+        config
+            .model_options
+            .insert("agent".into(), serde_json::json!("review"));
+        assert_eq!(zc::ChatConfig::try_from(ffi.clone()).unwrap(), config);
+        ffi.agent = None;
+        config.model_options.remove("agent");
+        assert_eq!(zc::ChatConfig::try_from(ffi).unwrap(), config);
+    }
 }
